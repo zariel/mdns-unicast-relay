@@ -1,27 +1,36 @@
 name: CI
 
 on:
-  push:
-    branches:
-      - "**"
   pull_request:
+  push:
+    branches-ignore:
+      # Release Please branches already get CI through pull_request.
+      - "release-please--branches--**"
+  release:
+    types: [published]
 
 permissions:
   contents: read
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name != 'release' }}
+
+env:
+  IMAGE_NAME: ghcr.io/zariel/mdns-unicast-relay
 
 jobs:
   verify:
     name: Verify
     runs-on: ubuntu-latest
+    outputs:
+      go_version: ${{ steps.go.outputs.go-version }}
     steps:
       - name: Check out repository
         uses: actions/checkout@v7
 
       - name: Install Go toolchain
+        id: go
         uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
@@ -42,10 +51,50 @@ jobs:
         run: go test -race ./...
 
   publish:
-    name: Publish
-    if: github.event_name == 'push'
+    name: Publish container image
+    if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'release'
     needs: verify
+    runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
-    uses: ./.github/workflows/image.yml
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Generate image metadata
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest,enable=${{ github.event_name == 'release' }}
+            type=sha,prefix=sha-
+
+      - name: Build and publish image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            GO_VERSION=${{ needs.verify.outputs.go_version }}
+            VERSION=${{ steps.meta.outputs.version }}
+            VCS_REF=${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
